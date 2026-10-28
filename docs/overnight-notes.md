@@ -58,7 +58,7 @@ App:
   tracebacks hidden in production, detection cache per photo+colour,
   developer-only export behind `SENDY_DEV=1`, optional
   `SENDY_ACCESS_CODE` for a private beta.
-- Deploy files for Railway: `railway.toml`, `.dockerignore`,
+- Deploy files for Railway: `railpack.json`, `.dockerignore`,
   `.python-version`. Dead scratch files removed from the repo root.
 
 ## Smoke test (real API, 2026-10-28 06:30)
