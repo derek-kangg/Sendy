@@ -385,8 +385,10 @@ def find_hold_candidates(image_path, colour, min_area=80):
                                "x": cx, "y": cy, "size": size, "grp": grp})
 
     deduped = _dedup_overlaps(candidates)
+    # Keep the split lineage: pieces the watershed separated at a thin pinch
+    # are evidence of two holds, and the validation pass should know it.
     for c in deduped:
-        c.pop("grp", None)
+        c["split_group"] = c.pop("grp", None)
     return deduped
 
 
@@ -467,10 +469,29 @@ def detect_and_validate_holds(client, image_path, colour):
     raw.save(raw_buf, format="JPEG")
     raw_data = base64.b64encode(raw_buf.getvalue()).decode("utf-8")
 
+    # Give the validator the evidence the colour stage already has: which
+    # marker is highest/lowest (start and finish holds, the costliest to lose)
+    # and which markers came out of one blob split at a thin pinch.
+    top_i    = min(range(len(candidates)), key=lambda i: candidates[i]["y"]) + 1
+    bottom_i = max(range(len(candidates)), key=lambda i: candidates[i]["y"]) + 1
     candidate_list = "\n".join(
         f"Candidate {i}: x={c['x']}, y={c['y']}, size={c['size']}"
+        + (" — the HIGHEST marker on the wall" if i == top_i else "")
+        + (" — the LOWEST marker on the wall" if i == bottom_i and i != top_i else "")
         for i, c in enumerate(candidates, 1)
     )
+    split_groups = {}
+    for i, c in enumerate(candidates, 1):
+        if c.get("split_group") is not None:
+            split_groups.setdefault(c["split_group"], []).append(i)
+    split_notes = "\n".join(
+        f"Candidates {', '.join(map(str, nums[:-1]))} and {nums[-1]} were ONE colour blob that shape analysis "
+        f"split at a thin pinch — most likely separate holds touching or stacked (common on gym walls). "
+        f"Merge them only if image 1 clearly shows one continuous hold under them."
+        for nums in split_groups.values() if len(nums) >= 2
+    )
+    if split_notes:
+        split_notes = "\nSHAPE ANALYSIS NOTES:\n" + split_notes + "\n"
 
     tool = {
         "name": "submit_validated_holds",
@@ -510,14 +531,14 @@ def detect_and_validate_holds(client, image_path, colour):
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": raw_data}},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
-                {"type": "text", "text": f"""Image 1 is a clean photo of a climbing wall. Image 2 is the same photo with {len(candidates)} numbered candidate markers detected by colour analysis (target colour: {colour}). Use image 1 to see details the markers cover in image 2. Automated detection makes two kinds of mistakes you must correct:
-- One physical hold can carry MULTIPLE markers (chalk patches or two-tone colouring split it). Look carefully at each cluster of nearby markers and decide whether they sit on one hold or several.
-- A marker can sit on route TAPE or another non-hold object instead of a hold.
+                {"type": "text", "text": f"""Image 1 is a clean photo of a climbing wall. Image 2 is the same photo with {len(candidates)} numbered candidate markers detected by colour analysis (target colour: {colour}). Use image 1 to see details the markers cover in image 2. Automated detection makes two kinds of mistakes you can correct — but every correction costs the climber effort if it is wrong, so correct only what you can actually see:
+- One physical hold can carry MULTIPLE markers (chalk patches or two-tone colouring split it). Merge markers ONLY when image 1 shows one continuous piece of plastic under both. Two holds of the same colour that touch or stack are common on gym walls; when in doubt keep them separate — removing an extra marker is one tap for the climber, re-adding a lost hold is three.
+- A marker can sit on route TAPE or another non-hold object. Thin tape strips have already been removed automatically, so this is rare: label "tape" ONLY when the marker's centre is on tape or on bare wall. A hold with tape beside, under or touching it is a HOLD — tape marks the start and finish holds, so markers next to tape are often the most important holds on the route. Never discard the highest or lowest candidate unless you are certain it is not a hold.
 
 {candidate_list}
-
+{split_notes}
 For every candidate number, report:
-1. hold_type: jug / crimp / sloper / pinch / pocket / edge / volume / chip — or "tape" if the marker is on tape or not on any hold
+1. hold_type: jug / crimp / sloper / pinch / pocket / edge / volume / chip — or "tape" only if the marker itself is on tape or on bare wall
 2. best_use: handhold, foothold, or both (small chips are typically footholds)
 3. orientation — which way the usable surface faces: top (pull down, normal), undercling (surface faces DOWN, palm-up), side-pull left or right. Look at shadows and shape.
 4. same_hold_as: if this marker is on the SAME physical hold as a lower-numbered marker, give that lower number; otherwise null.

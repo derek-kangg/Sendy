@@ -203,3 +203,53 @@ class ColourStageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ValidationEvidenceTests(unittest.TestCase):
+    """The validation prompt must carry the colour stage's evidence: which
+    markers are highest/lowest and which came out of one blob split at a
+    pinch, so a finish hold next to tape or a stacked pair is not thrown away."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "wall.jpg")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _prompt(self, blobs):
+        _wall(self.path, blobs=blobs)
+        client = _FakeClient(holds=[{"number": 1, "hold_type": "jug", "best_use": "handhold",
+                                     "orientation": "top", "same_hold_as": None}])
+        detect_and_validate_holds(client, self.path, "Blue")
+        return client.calls[0]["messages"][0]["content"][-1]["text"]
+
+    def test_highest_and_lowest_markers_are_flagged(self):
+        text = self._prompt([(200, 800, 30), (400, 500, 25), (600, 200, 35)])
+        self.assertIn("HIGHEST marker", text)
+        self.assertIn("LOWEST marker", text)
+        self.assertIn("Never discard the highest or lowest candidate", text)
+        self.assertIn("one tap for the climber", text)
+
+    def test_split_pair_is_reported_as_shape_evidence(self):
+        # two fat circles joined by a thin neck: one blob, split by the watershed
+        img = np.full((1000, 800, 3), (60, 60, 60), dtype=np.uint8)
+        cv2.circle(img, (300, 500), 70, (220, 90, 20), -1)
+        cv2.circle(img, (520, 500), 70, (220, 90, 20), -1)
+        cv2.rectangle(img, (300, 490), (520, 510), (220, 90, 20), -1)
+        cv2.imwrite(self.path, img)
+        cands = find_hold_candidates(self.path, "Blue")
+        self.assertEqual(len(cands), 2)
+        self.assertIsNotNone(cands[0]["split_group"])
+        self.assertEqual(cands[0]["split_group"], cands[1]["split_group"])
+        client = _FakeClient(holds=[])
+        with self.assertRaises(DetectionError):
+            detect_and_validate_holds(client, self.path, "Blue")
+        text = client.calls[0]["messages"][0]["content"][-1]["text"]
+        self.assertIn("SHAPE ANALYSIS NOTES", text)
+        self.assertIn("Candidates 1 and 2 were ONE colour blob", text)
+
+    def test_lone_holds_carry_no_split_group(self):
+        _wall(self.path, blobs=[(200, 800, 30), (600, 200, 35)])
+        for c in find_hold_candidates(self.path, "Blue"):
+            self.assertIsNone(c["split_group"])
