@@ -58,7 +58,7 @@ App:
   tracebacks hidden in production, detection cache per photo+colour,
   developer-only export behind `SENDY_DEV=1`, optional
   `SENDY_ACCESS_CODE` for a private beta.
-- Deploy files for Railway: `railpack.json`, `.dockerignore`,
+- Deploy files: `Dockerfile`, `fly.toml`, `.dockerignore`,
   `.python-version`. Dead scratch files removed from the repo root.
 
 ## Smoke test (real API, 2026-10-28 06:30)
@@ -77,7 +77,7 @@ reattached and kept going), and animated the result.
 ## Decisions only you can make (defaults recommended)
 
 1. **Host** — recommended: Railway Hobby, one replica, app sleeping off.
-   ~$5/mo fixed + Anthropic usage. Cloud Run (~$0 with a cold-start
+   ~$5-7/mo fixed + Anthropic usage. Railway paused sign-ups on 2026-10-28, so Fly.io first (docs/deploy.md). Cloud Run (~$0 with a cold-start
    spinner) is the fallback if $5 is too much. Streamlit Community Cloud
    cannot be the product host (12 h sleep + manual wake).
 2. **Monthly ceiling** — recommended: `SENDY_DAILY_BUDGET_USD=5`
