@@ -1,4 +1,4 @@
-# ClimbAI 🧗
+# Sendy 🧗
 
 Upload a photo of a bouldering wall and get an AI-generated, physically-validated
 climbing sequence — animated on your photo, move by move.
