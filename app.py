@@ -68,7 +68,9 @@ def _job_store():
 
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ROUTES_ROOT      = os.path.join(_APP_DIR, "saved_routes")
+# SENDY_DATA_DIR: point this at a mounted volume in production so visitors'
+# routes (and access-code unlocks) survive a redeploy; default is ephemeral.
+ROUTES_ROOT      = os.getenv("SENDY_DATA_DIR", "").strip() or os.path.join(_APP_DIR, "saved_routes")
 TEST_ROUTES_ROOT = os.path.join(_APP_DIR, "test_routes")
 
 

@@ -4,7 +4,8 @@
 # jobs in one Python process, so it must run as a SINGLE replica with app
 # sleeping off. Set these in the Railway dashboard:
 #   Variables: ANTHROPIC_API_KEY, optionally SENDY_ACCESS_CODE,
-#              SENDY_DAILY_BUDGET_USD, SENDY_MAX_GENERATIONS_PER_DAY
+#              SENDY_DAILY_BUDGET_USD, SENDY_MAX_GENERATIONS_PER_DAY,
+#              SENDY_DATA_DIR=/data with a volume mounted at /data
 #   Settings:  replicas = 1, App Sleeping = off, a hard usage limit on the plan
 
 [build]
@@ -16,4 +17,3 @@ healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 120
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
-numReplicas = 1
