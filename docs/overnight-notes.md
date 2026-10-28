@@ -61,6 +61,19 @@ App:
 - Deploy files for Railway: `railway.toml`, `.dockerignore`,
   `.python-version`. Dead scratch files removed from the repo root.
 
+## Smoke test (real API, 2026-10-28 06:30)
+
+On the route-01 test wall, restored from a per-visitor link: tapped Hold 5
+as the start, hit Generate, reloaded the page mid-generation (it
+reattached and kept going), and animated the result.
+
+- Beta: start both hands 5 / LF 2 / RF 1 (same start you climb it with),
+  then RH→6, LH→7, RF→3, RH→8, LF→6, RH→9, match. Status `complete`.
+- 8 model calls, **$0.042 total**; calls 2-8 cost $0.0045 each because the
+  cached system block was hitting (the first call, which wrote the cache,
+  was $0.010).
+- Tap image shipped to the browser: 122 KB JPEG.
+
 ## Decisions only you can make (defaults recommended)
 
 1. **Host** — recommended: Railway Hobby, one replica, app sleeping off.
