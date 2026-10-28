@@ -32,8 +32,8 @@ climbing sequence — animated on your photo, move by move.
 ## Setup
 
 ```bash
-git clone https://github.com/derek-kangg/ProjectClimb.git
-cd ProjectClimb
+git clone https://github.com/derek-kangg/Sendy.git
+cd Sendy
 python -m venv venv
 venv\Scripts\activate        # Windows  (source venv/bin/activate on macOS/Linux)
 pip install -r requirements.txt
