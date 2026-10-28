@@ -1,4 +1,4 @@
-# ClimbAI: deployment readiness assessment
+# Sendy: deployment readiness assessment
 
 Scope: `C:\Users\derek\climbai` as it stands on `main` (the uncommitted `claude/production-hardening` worktree already covers some engine items; noted where it matters). Line references are to `app.py`, `hold_detection.py`, `sequence_engine.py`, `route_graph.py`, `beta_animation.py` on `main`.
 
@@ -83,14 +83,14 @@ Decisions you have to make, with defaults:
 Before any code (Saturday morning, ~2 h):
 - Create a dedicated Anthropic Console workspace with a new key and a $25 monthly limit. Rotate and delete the old key (it was in Community Cloud secrets and sits in `.env`).
 - Delete the Community Cloud app outright; fix `README.md:6`.
-- Railway project from GitHub: `Procfile` (`web: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`), `.python-version` = 3.12, env vars `ANTHROPIC_API_KEY`, `CLIMBAI_ACCESS_CODE`, one replica, App Sleeping off, health check `/_stcore/health`, hard usage limit $10. Add `.railwayignore` for `venv/`, `saved_routes/`, `test_routes/`, `yolov8n.pt`, `wall*.jpg`, `*_test.py`, the stray root scripts, and delete the `0:` artifact in the worktree.
+- Railway project from GitHub: `Procfile` (`web: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`), `.python-version` = 3.12, env vars `ANTHROPIC_API_KEY`, `SENDY_ACCESS_CODE`, one replica, App Sleeping off, health check `/_stcore/health`, hard usage limit $10. Add `.railwayignore` for `venv/`, `saved_routes/`, `test_routes/`, `yolov8n.pt`, `wall*.jpg`, `*_test.py`, the stray root scripts, and delete the `0:` artifact in the worktree.
 - Finish the two failing worktree tests first (`test_hand_to_wall_is_rejected_then_corrected`, `test_over_extension_requires_a_foot_move_first`); run `scripts/eval_route.py` on route-01 and keep the scores as the regression gate for everything below.
 
 Code, weekend 1:
 - **Ingest once per `uploaded_file.file_id`** replacing `app.py:476-479`: reject `w*h > 24e6` with a clear message, `ImageOps.exif_transpose`, RGB, `thumbnail((1600,1600))`, JPEG q85 to one temp path, unlink the previous, pop holds/annotated/sequence/states/start_holds/beta_gif/last_click so a new photo cannot inherit the old route. Wire `image_ingest.py` from the branch. Offer `st.camera_input` beside the uploader feeding the same path.
 - `app.py:529`: add `image_format="JPEG", jpeg_quality=80`. Use the same downscaled base for `draw_move_overlay`/`st.image`.
 - `.streamlit/config.toml`: `[server] maxUploadSize = 10`, `[client] showErrorDetails = "type"`.
-- **Delete persistence**: remove the four `save_route()` calls (`:497, :561, :662, :723`) and the Load-route branch (`:501-512`); gate section 07 behind `CLIMBAI_DEV`. Add "Save route to my phone" `st.download_button` (JSON with embedded JPEG) and an "Open a saved route" JSON uploader. One line of copy: "photos are processed in memory and not kept."
+- **Delete persistence**: remove the four `save_route()` calls (`:497, :561, :662, :723`) and the Load-route branch (`:501-512`); gate section 07 behind `SENDY_DEV`. Add "Save route to my phone" `st.download_button` (JSON with embedded JPEG) and an "Open a saved route" JSON uploader. One line of copy: "photos are processed in memory and not kept."
 - **Spend gate**: access-code `text_input` gating everything; per-session counters (3 detects / 3 generates / 5 coachings); `@st.cache_resource` daily counter with a `Lock`; `max_chars=300` on `extra_notes` (`:472`), `800` on `user_beta` (`:750`); `max_calls=30` per Generate. Build the client as `anthropic.Anthropic(api_key=..., timeout=60.0, max_retries=2)` at `:29`. Reuse `guardrails.py`'s metered client and log `response.usage` per call with the session id.
 - **Honest failures**: one most-specific-first chain (`AuthenticationError`, 402/billing -> "out of budget, try later", `RateLimitError`, `BadRequestError`, `APITimeoutError`/`APIConnectionError`) with `logging.exception` and request id at `:498, :647, :771`; reuse the engine's `_friendly_api_error()` for detect and coach. `st.warning("No <colour> holds found ...")` at `:514`, no autosave on empty. Try/except around `_render_and_store_gif` (`:713`). `html.escape(cue)` before `:691`.
 - `hold_detection.py:302`: `max_tokens=4096`, check `stop_reason == "max_tokens"`, cap candidates at the 60 largest (the branch already has this).

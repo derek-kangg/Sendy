@@ -31,10 +31,10 @@ load_dotenv()
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("climbai.app")
+log = logging.getLogger("sendy.app")
 
-DEV_MODE          = os.getenv("CLIMBAI_DEV", "").strip().lower() in ("1", "true", "yes")
-ACCESS_CODE       = os.getenv("CLIMBAI_ACCESS_CODE", "").strip()   # empty = open to everyone
+DEV_MODE          = os.getenv("SENDY_DEV", "").strip().lower() in ("1", "true", "yes")
+ACCESS_CODE       = os.getenv("SENDY_ACCESS_CODE", "").strip()   # empty = open to everyone
 CLICK_IMAGE_MAX_W = 900          # what the tap-to-select component ships to the phone
 VISITOR_TTL_S     = 24 * 3600    # per-visitor working folders older than this are purged
 JOB_TTL_S         = 3600         # finished generation jobs are kept this long for reattach
@@ -201,7 +201,7 @@ def _clear_route_state():
 
 
 def export_test_route(slug, colour, wall_angle, difficulty):
-    """Developer tool (CLIMBAI_DEV=1): write the current route into
+    """Developer tool (SENDY_DEV=1): write the current route into
     test_routes/<slug>/ in the evaluation format."""
     target = os.path.join(TEST_ROUTES_ROOT, slug)
     os.makedirs(target, exist_ok=True)
@@ -488,7 +488,7 @@ def _generation_progress():
 
 # ---- UI ----
 
-st.set_page_config(page_title="ClimbAI", page_icon="🧗", layout="centered")
+st.set_page_config(page_title="Sendy", page_icon="🧗", layout="centered")
 
 st.markdown("""
 <style>
@@ -630,7 +630,7 @@ hr { margin: 1.6rem 0 !important; opacity: 0.25; }
 </style>
 
 <div class="climb-hero">
-    <h1 class="wordmark">climb<span class="accent">ai</span></h1>
+    <h1 class="wordmark">send<span class="accent">y</span></h1>
     <p class="tagline">Route reading, assisted. Upload a wall photo — get a suggested beta and coaching feedback on your own.</p>
 </div>
 """, unsafe_allow_html=True)
@@ -643,7 +643,7 @@ def section_header(num, title, caption=None):
 
 
 if not get_api_key():
-    st.error("ClimbAI isn't configured yet — the owner needs to set ANTHROPIC_API_KEY.")
+    st.error("Sendy isn't configured yet — the owner needs to set ANTHROPIC_API_KEY.")
     st.stop()
 
 
@@ -660,7 +660,7 @@ def _unlocked():
 
 
 if not _unlocked():
-    st.markdown("""<p class="section-caption">ClimbAI is in a private beta. Enter the access code you were given.</p>""", unsafe_allow_html=True)
+    st.markdown("""<p class="section-caption">Sendy is in a private beta. Enter the access code you were given.</p>""", unsafe_allow_html=True)
     code = st.text_input("Access code", type="password", label_visibility="collapsed", placeholder="Access code")
     if st.button("Enter", type="primary"):
         if hmac.compare_digest(code.strip(), ACCESS_CODE):
@@ -675,8 +675,8 @@ if not _unlocked():
 
 anthropic_client = get_client()
 
-if os.getenv("CLIMBAI_DISABLED", "").strip().lower() in ("1", "true", "yes"):
-    st.info("ClimbAI's AI features are switched off right now — routes you already generated still work.")
+if os.getenv("SENDY_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+    st.info("Sendy's AI features are switched off right now — routes you already generated still work.")
 
 # A generation started before a refresh or a dropped connection: pick it back up.
 _qp_job = st.query_params.get("job")
@@ -1060,7 +1060,7 @@ if "sequence" in st.session_state and st.session_state["sequence"]:
                 st.download_button(
                     "Download GIF",
                     st.session_state["beta_gif"],
-                    file_name="climbai-beta.gif",
+                    file_name="sendy-beta.gif",
                     mime="image/gif",
                     use_container_width=True,
                 )
@@ -1140,4 +1140,4 @@ if DEV_MODE:
     with st.expander("Developer: today's usage"):
         st.json(guardrails.LEDGER.status())
 
-st.markdown("""<p class="climb-footer">climbai &mdash; get through the plateau</p>""", unsafe_allow_html=True)
+st.markdown("""<p class="climb-footer">sendy &mdash; get through the plateau</p>""", unsafe_allow_html=True)

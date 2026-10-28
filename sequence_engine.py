@@ -40,7 +40,7 @@ LIMBS = (
     "swap right foot", "swap left foot",
 )
 
-log = logging.getLogger("climbai.engine")
+log = logging.getLogger("sendy.engine")
 
 
 @dataclass

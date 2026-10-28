@@ -40,7 +40,7 @@ def _usage(**kw):
 class LedgerTests(unittest.TestCase):
     def test_per_visitor_generation_limit(self):
         ledger = Ledger()
-        with _Env(CLIMBAI_MAX_GENERATIONS_PER_VISITOR=2, CLIMBAI_DISABLED=None):
+        with _Env(SENDY_MAX_GENERATIONS_PER_VISITOR=2, SENDY_DISABLED=None):
             for _ in range(2):
                 ledger.check("generate", "alice")
                 ledger.count("generate", "alice")
@@ -51,7 +51,7 @@ class LedgerTests(unittest.TestCase):
 
     def test_global_daily_generation_limit(self):
         ledger = Ledger()
-        with _Env(CLIMBAI_MAX_GENERATIONS_PER_DAY=3, CLIMBAI_MAX_GENERATIONS_PER_VISITOR=99, CLIMBAI_DISABLED=None):
+        with _Env(SENDY_MAX_GENERATIONS_PER_DAY=3, SENDY_MAX_GENERATIONS_PER_VISITOR=99, SENDY_DISABLED=None):
             for i in range(3):
                 ledger.check("generate", f"v{i}")
                 ledger.count("generate", f"v{i}")
@@ -62,11 +62,11 @@ class LedgerTests(unittest.TestCase):
         ledger = Ledger()
         cost = ledger.record_usage(_usage(input_tokens=1_000_000))   # $3 of input
         self.assertAlmostEqual(cost, 3.0)
-        with _Env(CLIMBAI_DAILY_BUDGET_USD=2.5, CLIMBAI_DISABLED=None):
+        with _Env(SENDY_DAILY_BUDGET_USD=2.5, SENDY_DISABLED=None):
             for action in ("detect", "generate", "coach"):
                 with self.assertRaises(LimitExceeded):
                     ledger.check(action, "anyone")
-        with _Env(CLIMBAI_DAILY_BUDGET_USD=10, CLIMBAI_DISABLED=None):
+        with _Env(SENDY_DAILY_BUDGET_USD=10, SENDY_DISABLED=None):
             ledger.check("generate", "anyone")
 
     def test_cache_tokens_are_priced_separately(self):
@@ -76,10 +76,10 @@ class LedgerTests(unittest.TestCase):
 
     def test_kill_switch(self):
         ledger = Ledger()
-        with _Env(CLIMBAI_DISABLED="1"):
+        with _Env(SENDY_DISABLED="1"):
             with self.assertRaises(LimitExceeded):
                 ledger.check("detect", "anyone")
-        with _Env(CLIMBAI_DISABLED=None):
+        with _Env(SENDY_DISABLED=None):
             ledger.check("detect", "anyone")
 
     def test_status_summary(self):

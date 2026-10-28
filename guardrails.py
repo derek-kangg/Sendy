@@ -9,12 +9,12 @@ they make sure one bad afternoon costs dollars, not hundreds.
 Every knob is an environment variable so hosting can tune it without a code
 change:
 
-    CLIMBAI_DISABLED=1                      kill switch — every AI action refuses
-    CLIMBAI_DAILY_BUDGET_USD=5              estimated spend after which AI actions stop
-    CLIMBAI_MAX_GENERATIONS_PER_DAY=150     betas generated, across all visitors
-    CLIMBAI_MAX_GENERATIONS_PER_VISITOR=8   per visitor (browser session) per day
-    CLIMBAI_MAX_DETECTIONS_PER_VISITOR=20
-    CLIMBAI_MAX_COACHING_PER_VISITOR=10
+    SENDY_DISABLED=1                      kill switch — every AI action refuses
+    SENDY_DAILY_BUDGET_USD=5              estimated spend after which AI actions stop
+    SENDY_MAX_GENERATIONS_PER_DAY=150     betas generated, across all visitors
+    SENDY_MAX_GENERATIONS_PER_VISITOR=8   per visitor (browser session) per day
+    SENDY_MAX_DETECTIONS_PER_VISITOR=20
+    SENDY_MAX_COACHING_PER_VISITOR=10
 
 Usage is metered by wrapping the Anthropic client (see wrap_client), so the
 engine modules stay unaware of this file.
@@ -25,7 +25,7 @@ import os
 import threading
 import time
 
-log = logging.getLogger("climbai.guardrails")
+log = logging.getLogger("sendy.guardrails")
 
 # Sonnet 4.6 list prices, USD per token
 _PRICE = {
@@ -80,22 +80,22 @@ class Ledger:
 
     def check(self, action, visitor_id):
         """Raise LimitExceeded if `visitor_id` may not perform `action` now."""
-        if os.getenv("CLIMBAI_DISABLED", "").strip().lower() in ("1", "true", "yes"):
-            raise LimitExceeded("ClimbAI's AI features are switched off right now — check back later.")
+        if os.getenv("SENDY_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+            raise LimitExceeded("Sendy's AI features are switched off right now — check back later.")
 
         with self._lock:
             self._roll_day_locked()
-            budget = _env_float("CLIMBAI_DAILY_BUDGET_USD", 5.0)
+            budget = _env_float("SENDY_DAILY_BUDGET_USD", 5.0)
             if budget > 0 and self.spent_usd >= budget:
                 raise LimitExceeded(
-                    "ClimbAI has used up today's AI budget. Come back tomorrow — "
+                    "Sendy has used up today's AI budget. Come back tomorrow — "
                     "routes you already generated still work."
                 )
 
             mine = self._visitor.setdefault(visitor_id, {a: 0 for a in self.ACTIONS})
             if action == "generate":
-                per_visitor = _env_int("CLIMBAI_MAX_GENERATIONS_PER_VISITOR", 8)
-                per_day     = _env_int("CLIMBAI_MAX_GENERATIONS_PER_DAY", 150)
+                per_visitor = _env_int("SENDY_MAX_GENERATIONS_PER_VISITOR", 8)
+                per_day     = _env_int("SENDY_MAX_GENERATIONS_PER_DAY", 150)
                 if mine["generate"] >= per_visitor:
                     raise LimitExceeded(
                         f"You've generated {per_visitor} betas today — that's the daily limit per climber. "
@@ -103,21 +103,21 @@ class Ledger:
                     )
                 if self._global["generate"] >= per_day:
                     raise LimitExceeded(
-                        "ClimbAI is busy today and has reached its daily limit for new betas. "
+                        "Sendy is busy today and has reached its daily limit for new betas. "
                         "Please try again tomorrow."
                     )
             elif action == "detect":
-                per_visitor = _env_int("CLIMBAI_MAX_DETECTIONS_PER_VISITOR", 20)
+                per_visitor = _env_int("SENDY_MAX_DETECTIONS_PER_VISITOR", 20)
                 if mine["detect"] >= per_visitor:
                     raise LimitExceeded(
                         f"You've run hold detection {per_visitor} times today — that's the daily limit per climber."
                     )
-                if self._global["detect"] >= 2 * _env_int("CLIMBAI_MAX_GENERATIONS_PER_DAY", 150):
+                if self._global["detect"] >= 2 * _env_int("SENDY_MAX_GENERATIONS_PER_DAY", 150):
                     raise LimitExceeded(
-                        "ClimbAI is busy today and has reached its daily limit. Please try again tomorrow."
+                        "Sendy is busy today and has reached its daily limit. Please try again tomorrow."
                     )
             elif action == "coach":
-                per_visitor = _env_int("CLIMBAI_MAX_COACHING_PER_VISITOR", 10)
+                per_visitor = _env_int("SENDY_MAX_COACHING_PER_VISITOR", 10)
                 if mine["coach"] >= per_visitor:
                     raise LimitExceeded(
                         f"You've asked for coaching {per_visitor} times today — that's the daily limit per climber."

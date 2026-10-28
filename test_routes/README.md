@@ -1,6 +1,6 @@
 # Test Routes
 
-Real climbs with known-good beta, used to evaluate and improve ClimbAI's
+Real climbs with known-good beta, used to evaluate and improve Sendy's
 route generation. One folder per route.
 
 ## Folder format

@@ -56,8 +56,8 @@ App:
   finish-hold selector.
 - Optional camera capture, privacy line, typed error messages everywhere,
   tracebacks hidden in production, detection cache per photo+colour,
-  developer-only export behind `CLIMBAI_DEV=1`, optional
-  `CLIMBAI_ACCESS_CODE` for a private beta.
+  developer-only export behind `SENDY_DEV=1`, optional
+  `SENDY_ACCESS_CODE` for a private beta.
 - Deploy files for Railway: `railway.toml`, `.dockerignore`,
   `.python-version`. Dead scratch files removed from the repo root.
 
@@ -80,11 +80,11 @@ reattached and kept going), and animated the result.
    ~$5/mo fixed + Anthropic usage. Cloud Run (~$0 with a cold-start
    spinner) is the fallback if $5 is too much. Streamlit Community Cloud
    cannot be the product host (12 h sleep + manual wake).
-2. **Monthly ceiling** — recommended: `CLIMBAI_DAILY_BUDGET_USD=5`
+2. **Monthly ceiling** — recommended: `SENDY_DAILY_BUDGET_USD=5`
    (≈$150/mo absolute worst case, realistically $10-20) *and* a hard
    spend limit on a dedicated Anthropic Console workspace.
 3. **Private or public first** — recommended: private beta with
-   `CLIMBAI_ACCESS_CODE` for the gym friends for two weeks, then open.
+   `SENDY_ACCESS_CODE` for the gym friends for two weeks, then open.
 4. **Web vs native** — recommended: this web app now; the FastAPI + PWA
    path later, once real climbers have used it and you have a measured
    per-route cost from the ledger.
@@ -98,7 +98,7 @@ reattached and kept going), and animated the result.
       `projectclimb.streamlit.app` is a sign-in wall today, and the README
       still links to it.
 - [ ] Create the Railway project from this repo (after merge), set
-      `ANTHROPIC_API_KEY` (+ optional `CLIMBAI_ACCESS_CODE`), set replicas
+      `ANTHROPIC_API_KEY` (+ optional `SENDY_ACCESS_CODE`), set replicas
       to 1, App Sleeping off, and a hard usage limit on the plan.
 - [ ] Soak test from two phones: generate on both, lock one screen at
       30 s, pull-to-refresh the other, upload a non-image renamed `.jpg`.
@@ -111,3 +111,43 @@ reattached and kept going), and animated the result.
 - The library is per visitor and ephemeral (lost on redeploy); a durable
   per-user library needs accounts and storage (the PWA phase).
 - The in-process ledger and job registry assume one replica.
+
+## The App Store path (the end goal, kept in view)
+
+Derek's stated destination is a native app in the App Store / Play Store.
+The audit's Option 3 is that architecture; the judges ranked it last only
+on *sequencing* — it is 45-55 hours of work before anything is usable,
+which is where this project has stalled before — not on merit. The web
+app ships first so real climbers are using Sendy while the native app is
+built, and so the per-route cost is measured, not estimated.
+
+What last night's work already contributes to the native app:
+
+- `hold_detection.py`, `sequence_engine.py`, `route_graph.py`,
+  `beta_animation.py`, `image_ingest.py` and `guardrails.py` are headless.
+  They become the backend's brain unchanged; only `app.py` (Streamlit) is
+  throwaway.
+- `GenerationResult` + the progress callback are exactly what a `POST /beta`
+  job endpoint streams to a phone.
+- The ledger already prices every call, so the subscription/credit model
+  can be designed from real numbers.
+
+What it still takes (honest, solo, evenings + weekends):
+
+1. **Backend** (~1-2 weekends): FastAPI on the same Railway box —
+   `POST /detect`, `POST /beta` (job + progress via SSE), `POST /animate`,
+   `POST /coach`; API key stays server-side; per-user quotas replace the
+   per-visitor ones.
+2. **Accounts + storage** (~1 weekend): Supabase auth + per-user routes and
+   photos (Free tier to start; it pauses after a week idle, Pro is $25/mo).
+3. **Client** (~2-3 weekends to a TestFlight beta): Expo / React Native —
+   native camera, tap-to-select overlay drawn client-side, background
+   generation with push/poll, GIF or in-app animation.
+4. **Store overhead**: Apple Developer Program $99/yr, Google Play $25
+   one-time, privacy policy page, app review (photo upload + AI output
+   both need clear disclosure), screenshots.
+
+Suggested gate before starting (1): two weeks of gym friends using the web
+beta, at least ~30 real routes through the ledger, and the colour-detection
+session's improvements merged. At that point the backend and client can be
+planned as their own tracked piece of work.
