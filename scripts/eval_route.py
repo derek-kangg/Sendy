@@ -87,14 +87,17 @@ def main(route_dir):
     def progress(n, total):
         print(f"  move {n}...", end="\r")
 
-    sequence, states = generate_sequence_iteratively(
+    result = generate_sequence_iteratively(
         client, hold_descriptions, holds, graph, start_holds,
         height_cm, data["difficulty"], data["wall_angle"],
         data.get("finish_style", "TOP label"), "",
         image_height=image_height, progress_callback=progress,
     )
     elapsed = time.time() - t0
+    sequence = result.sequence
     ai_moves = [m for m in sequence if m["move_number"] > 0]
+    print(f"\nStatus: {result.status} ({result.calls} API calls)"
+          + (f" — {result.reason}" if result.reason else ""))
 
     # ---- scoring ----
     v_hands, a_hands = hand_moves(verified), hand_moves(ai_moves)

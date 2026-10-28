@@ -65,17 +65,27 @@ def compute_keypose(state, hold_px, dims):
         if h is not None and h in hold_px:
             pts[j] = hold_px[h]
 
-    hands = [pts[j] for j in ("LH", "RH") if j in pts]
+    hands      = [pts[j] for j in ("LH", "RH") if j in pts]
+    feet_known = [pts[j] for j in ("LF", "RF") if j in pts]
+
     if hands:
         hands_mid = _mid(hands)
-    else:  # degenerate, should not happen — park mid-image
+    elif feet_known:  # no hand on a hold (loaded/old data) — stand above the feet
+        fm = _mid(feet_known)
+        hands_mid = (fm[0], fm[1] - dims["torso"] - leg)
+    else:             # degenerate — park mid-image
         hands_mid = (leg * 2, leg * 2)
 
-    feet_known = [pts[j] for j in ("LF", "RF") if j in pts]
     if feet_known:
         feet_mid = _mid(feet_known)
     else:
         feet_mid = (hands_mid[0], hands_mid[1] + dims["torso"] + leg)
+
+    # A hand that is not on any hold hangs beside the other one rather than
+    # crashing the renderer
+    for j, side in (("LH", -1), ("RH", 1)):
+        if j not in pts:
+            pts[j] = (hands_mid[0] + side * dims["sh_hw"], hands_mid[1])
 
     hip = _lerp(hands_mid, feet_mid, 0.62)
 
@@ -194,7 +204,7 @@ def _label_for(move):
     if move["move_number"] == 0:
         return "Start position"
     hold_str = f"hold {move['hold']}" if move["hold"] is not None else "wall"
-    return f"Move {move['move_number']}: {move['limb']} → {hold_str}"
+    return f"Move {move['move_number']}: {move['limb']} -> {hold_str}"
 
 
 def _draw_label(draw, text, font, img_w):
@@ -209,7 +219,7 @@ def _draw_label(draw, text, font, img_w):
 
 
 def render_beta_gif(base_image, holds, sequence, states, height_cm=170,
-                    out_width=480, frame_ms=100):
+                    out_width=480, frame_ms=100, wall_height_cm=400):
     """Build the animated GIF. Returns io.BytesIO with the GIF bytes."""
     img = base_image.convert("RGB")
     scale = out_width / img.width
@@ -218,8 +228,8 @@ def render_beta_gif(base_image, holds, sequence, states, height_cm=170,
     hold_px = {h["number"]: (h["x"] * scale, h["y"] * scale) for h in holds}
 
     # Human proportions anchored to the climber's height, using the same
-    # 4m-wall scale assumption as the reachability graph
-    px_cm = base.height / 400.0
+    # wall-scale assumption as the reachability graph
+    px_cm = base.height / float(wall_height_cm or 400)
     dims = {
         "torso":   0.29  * height_cm * px_cm,
         "seg_arm": 0.21  * height_cm * px_cm,
@@ -306,7 +316,7 @@ def render_beta_gif(base_image, holds, sequence, states, height_cm=170,
 
     # linger on the final pose
     for _ in range(HOLD_FRAMES * 2):
-        add_frame(keyposes[n - 1], "Send! \U0001F389")
+        add_frame(keyposes[n - 1], "Send!")
 
     buf = io.BytesIO()
     frames[0].save(

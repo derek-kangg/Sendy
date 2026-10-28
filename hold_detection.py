@@ -9,12 +9,32 @@ Claude's vision pass (in app.py) then labels type/use/orientation.
 
 import base64
 import io
+import logging
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-VALIDATION_MODEL = "claude-sonnet-4-6"
+VALIDATION_MODEL  = "claude-sonnet-4-6"
+REQUEST_TIMEOUT_S = 90.0   # one vision call; the SDK default is 10 minutes
+MAX_CANDIDATES    = 60     # past this the photo needs cropping, not labelling
+
+log = logging.getLogger("climbai.detection")
+
+
+class DetectionError(Exception):
+    """Hold detection could not complete. The message is written for the climber."""
+
+
+class NoHoldsFound(DetectionError):
+    """The colour mask matched nothing worth calling a hold."""
+
+    def __init__(self, colour):
+        self.colour = colour
+        super().__init__(
+            f"No {colour.lower()} holds found in this photo. Check the route colour, "
+            "move closer so the holds are bigger, or add them by hand below."
+        )
 
 COLOUR_RANGES = {
     "Black":  [(0, 0, 0),      (180, 80, 50)],
@@ -132,6 +152,8 @@ def find_hold_candidates(image_path, colour, min_area=80):
     """Detect hold candidates for a route colour. Returns a list of dicts:
     {bx, by, bw, bh, x, y, size} in full-image pixel coordinates."""
     cv_image = cv2.imread(image_path)
+    if cv_image is None:
+        raise DetectionError("Couldn't read that photo — please upload it again.")
     img_h, img_w = cv_image.shape[:2]
     hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
 
@@ -245,7 +267,13 @@ def detect_and_validate_holds(client, image_path, colour):
     candidates = find_hold_candidates(image_path, colour)
 
     if not candidates:
-        return Image.open(image_path).convert("RGB"), []
+        raise NoHoldsFound(colour)
+    if len(candidates) > MAX_CANDIDATES:
+        # Keep the biggest blobs; the rest are almost always noise, and past
+        # this count the validation call itself becomes unreliable.
+        log.warning("%d %s candidates — keeping the %d largest", len(candidates), colour, MAX_CANDIDATES)
+        candidates = sorted(candidates, key=lambda c: c["bw"] * c["bh"], reverse=True)[:MAX_CANDIDATES]
+        candidates.sort(key=lambda c: (c["y"], c["x"]))
 
     # Draw numbered candidates on a preview image for Claude to assess
     preview = Image.open(image_path).convert("RGB")
@@ -297,9 +325,12 @@ def detect_and_validate_holds(client, image_path, colour):
         }
     }
 
+    # ~45 output tokens per candidate; a fixed 1500 silently truncated busy colours
+    max_tokens = min(8000, 300 + 70 * len(candidates))
     response = client.messages.create(
         model=VALIDATION_MODEL,
-        max_tokens=1500,
+        max_tokens=max_tokens,
+        timeout=REQUEST_TIMEOUT_S,
         tools=[tool],
         tool_choice={"type": "any"},
         messages=[{
@@ -327,9 +358,20 @@ Assess every single candidate — do not skip any."""}
     validated = {}
     for block in response.content:
         if block.type == "tool_use" and block.name == "submit_validated_holds":
-            for h in block.input["holds"]:
-                validated[h["number"]] = h
+            for h in (block.input or {}).get("holds") or []:
+                if isinstance(h, dict) and isinstance(h.get("number"), int):
+                    validated[h["number"]] = h
             break
+
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        log.warning("validation output truncated at %d tokens for %d candidates (%d labelled)",
+                    max_tokens, len(candidates), len(validated))
+        if not validated:
+            raise DetectionError(
+                "The hold check was cut short — try cropping the photo to just this route and detecting again."
+            )
+    elif not validated:
+        raise DetectionError("The hold check returned nothing usable — please try again.")
 
     groups = _resolve_merge_groups(validated, len(candidates))
 

@@ -1,13 +1,16 @@
-def build_reachability_graph(holds, image_height, image_width, climber_height_cm):
+DEFAULT_WALL_HEIGHT_CM = 400  # a typical bouldering wall, photographed top to bottom
+
+
+def build_reachability_graph(holds, image_height, image_width, climber_height_cm,
+                             wall_height_cm=DEFAULT_WALL_HEIGHT_CM):
     """
     Build a graph of reachable holds based on climber height and image scale.
-    
-    We estimate scale by assuming the image shows approximately 4 metres of wall height.
+
+    Scale comes from assuming the photo spans `wall_height_cm` of wall
+    (default 4 m); the UI lets the climber correct it for short or tall walls.
     Arm span is approximately equal to height, max reach is height * 1.3.
     """
-    
-    WALL_HEIGHT_CM = 400  # assume 4 metre bouldering wall
-    pixels_per_cm = image_height / WALL_HEIGHT_CM
+    pixels_per_cm = image_height / float(wall_height_cm or DEFAULT_WALL_HEIGHT_CM)
     
     max_reach_cm = climber_height_cm * 1.3
     max_reach_px = max_reach_cm * pixels_per_cm
@@ -27,7 +30,6 @@ def build_reachability_graph(holds, image_height, image_width, climber_height_cm
             dx = abs(other["x"] - hold["x"])
             dy = other["y"] - hold["y"]  # positive means lower on wall
 
-            # Only consider holds that are above or at same level
             # (dy negative means other hold is higher up)
             euclidean = (dx**2 + dy**2) ** 0.5
 
