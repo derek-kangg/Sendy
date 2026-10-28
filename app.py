@@ -462,6 +462,15 @@ def _consume_job(job):
     ss["current_step"]  = 0
     ss["base_image"]    = ss["annotated_image"]
     ss.pop("beta_gif", None)
+    # The animation is the product: render it with the beta so it is the
+    # first thing the climber sees, not a button they have to find.
+    try:
+        rp = ss.get("render_params") or {}
+        gif = render_beta_gif(ss["annotated_image"], ss["holds"], res.sequence, res.states,
+                              height_cm=rp.get("height_cm", 170), wall_height_cm=rp.get("wall_height_cm", 400))
+        ss["beta_gif"] = gif.getvalue()
+    except Exception:
+        log.exception("auto-render of the beta animation failed")
     save_route()
 
 
@@ -972,6 +981,7 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                     height_cm, difficulty, wall_angle, finish_style, extra_notes,
                     image_size, wall_height_cm,
                 )
+                st.session_state["render_params"] = {"height_cm": int(height_cm), "wall_height_cm": wall_height_cm}
                 st.session_state["job_id"] = job_id
                 st.query_params["job"] = job_id
                 st.rerun()
@@ -981,18 +991,51 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                 log.exception("could not start generation")
                 st.error("Couldn't start the beta generation — please try again.")
 
-if "instructions" in st.session_state:
-    if st.session_state.get("beta_status") and st.session_state["beta_status"] != "complete":
-        st.warning(f"This beta is incomplete — {st.session_state.get('beta_reason', '')} "
-                   "Showing the moves it did work out; generate again for another attempt.")
-    st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
-    st.markdown(st.session_state["instructions"])
-
 if "sequence" in st.session_state and st.session_state["sequence"]:
     sequence     = st.session_state["sequence"]
     current_step = min(st.session_state.get("current_step", 0), len(sequence) - 1)
 
-    section_header("05", "Walk it through", "Step through each move on the wall.")
+    section_header("05", "Your beta", "Watch it, then step through it. It's a starting point — adapt it to your body, strengths, and style.")
+
+    if st.session_state.get("beta_status") and st.session_state["beta_status"] != "complete":
+        st.warning(f"This beta is incomplete — {st.session_state.get('beta_reason', '')} "
+                   "Showing the moves it did work out; generate again for another attempt.")
+
+    # ---- Animation first ----
+    if "states" in st.session_state:
+        def _render_and_store_gif():
+            with st.spinner("Rendering animation..."):
+                gif_buf = render_beta_gif(
+                    st.session_state["base_image"],
+                    st.session_state["holds"],
+                    sequence,
+                    st.session_state["states"],
+                    height_cm=height_cm,
+                    wall_height_cm=wall_height_cm,
+                )
+                st.session_state["beta_gif"] = gif_buf.getvalue()
+                save_route()
+
+        if "beta_gif" not in st.session_state:      # e.g. a route saved before auto-render existed
+            _render_and_store_gif()
+
+        st.image(st.session_state["beta_gif"])
+        col_re, col_dl = st.columns(2)
+        with col_re:
+            if st.button("Re-render animation", use_container_width=True):
+                _render_and_store_gif()
+                st.rerun()
+        with col_dl:
+            st.download_button(
+                "Download GIF",
+                st.session_state["beta_gif"],
+                file_name="sendy-beta.gif",
+                mime="image/gif",
+                use_container_width=True,
+            )
+
+    # ---- Step through ----
+    st.markdown("""<p class="section-caption" style="margin-top:1.4rem;">Step through each move on the wall.</p>""", unsafe_allow_html=True)
 
     overlay_image = draw_move_overlay(
         st.session_state["base_image"],
@@ -1029,43 +1072,10 @@ if "sequence" in st.session_state and st.session_state["sequence"]:
                 st.session_state["current_step"] += 1
                 st.rerun()
 
-    # ---- Animated demo ----
-    if "states" in st.session_state:
-        st.markdown("""<p class="section-caption" style="margin-top:1.2rem;">Or watch the whole beta as an animation.</p>""", unsafe_allow_html=True)
-
-        def _render_and_store_gif():
-            with st.spinner("Rendering animation..."):
-                gif_buf = render_beta_gif(
-                    st.session_state["base_image"],
-                    st.session_state["holds"],
-                    sequence,
-                    st.session_state["states"],
-                    height_cm=height_cm,
-                    wall_height_cm=wall_height_cm,
-                )
-                st.session_state["beta_gif"] = gif_buf.getvalue()
-                save_route()
-
-        if "beta_gif" not in st.session_state:
-            if st.button("🎬 Animate the beta", use_container_width=True):
-                _render_and_store_gif()
-                st.rerun()
-
-        if "beta_gif" in st.session_state:
-            st.image(st.session_state["beta_gif"])
-            col_re, col_dl = st.columns(2)
-            with col_re:
-                if st.button("Re-render animation", use_container_width=True):
-                    _render_and_store_gif()
-                    st.rerun()
-            with col_dl:
-                st.download_button(
-                    "Download GIF",
-                    st.session_state["beta_gif"],
-                    file_name="sendy-beta.gif",
-                    mime="image/gif",
-                    use_container_width=True,
-                )
+    # ---- Written moves ----
+    if "instructions" in st.session_state:
+        st.markdown("""<p class="section-caption" style="margin-top:1.4rem;">Written out, move by move.</p>""", unsafe_allow_html=True)
+        st.markdown(st.session_state["instructions"])
 
 # ---- Rate My Beta ----
 if "annotated_image" in st.session_state and st.session_state.get("holds"):
