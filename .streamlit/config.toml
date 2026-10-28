@@ -8,3 +8,12 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# Phone photos are 3-8 MB; anything bigger is not a wall photo.
+maxUploadSize = 20
+
+[client]
+# Never show tracebacks (server paths, source lines) to visitors; errors are
+# logged server-side and the app shows its own messages.
+showErrorDetails = "none"

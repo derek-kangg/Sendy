@@ -1,0 +1,19 @@
+# Railway deployment (Hobby plan, one always-on replica).
+#
+# The app keeps per-visitor state and the in-process spend ledger / generation
+# jobs in one Python process, so it must run as a SINGLE replica with app
+# sleeping off. Set these in the Railway dashboard:
+#   Variables: ANTHROPIC_API_KEY, optionally CLIMBAI_ACCESS_CODE,
+#              CLIMBAI_DAILY_BUDGET_USD, CLIMBAI_MAX_GENERATIONS_PER_DAY
+#   Settings:  replicas = 1, App Sleeping = off, a hard usage limit on the plan
+
+[build]
+builder = "RAILPACK"
+
+[deploy]
+startCommand = "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true"
+healthcheckPath = "/_stcore/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+numReplicas = 1

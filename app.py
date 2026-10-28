@@ -1,21 +1,44 @@
-from route_graph import build_reachability_graph, format_graph_for_prompt
+from route_graph import build_reachability_graph
 from beta_animation import render_beta_gif
 from climbing_knowledge import coaching_knowledge
-from sequence_engine import build_holds_description, generate_sequence_iteratively
-from hold_detection import detect_and_validate_holds, redraw_annotation, marker_metrics as _marker_metrics
+from sequence_engine import (build_holds_description, generate_sequence_iteratively,
+                             friendly_api_error, MAX_MOVES)
+from hold_detection import (detect_and_validate_holds, redraw_annotation,
+                            marker_metrics as _marker_metrics, DetectionError, NoHoldsFound)
+from image_ingest import prepare_upload, ImageRejected
+import guardrails
+from guardrails import LimitExceeded
 from PIL import Image, ImageDraw
 import streamlit as st
 import anthropic
 from dotenv import load_dotenv
 import os
 import base64
-import tempfile
 import io
 import json
 import shutil
 import re
+import html
+import hashlib
+import hmac
+import logging
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("climbai.app")
+
+DEV_MODE          = os.getenv("CLIMBAI_DEV", "").strip().lower() in ("1", "true", "yes")
+ACCESS_CODE       = os.getenv("CLIMBAI_ACCESS_CODE", "").strip()   # empty = open to everyone
+CLICK_IMAGE_MAX_W = 900          # what the tap-to-select component ships to the phone
+VISITOR_TTL_S     = 24 * 3600    # per-visitor working folders older than this are purged
+JOB_TTL_S         = 3600         # finished generation jobs are kept this long for reattach
+
 
 def get_api_key():
     key = os.getenv("ANTHROPIC_API_KEY")
@@ -26,16 +49,72 @@ def get_api_key():
             key = None
     return key
 
-anthropic_client = anthropic.Anthropic(api_key=get_api_key())
+
+@st.cache_resource(show_spinner=False)
+def get_client():
+    """One metered Anthropic client shared by every session (connection
+    pooling + one spend ledger). Short timeouts: a hung call must not block
+    a climber for the SDK's default ten minutes."""
+    return guardrails.wrap_client(anthropic.Anthropic(api_key=get_api_key(), timeout=60.0, max_retries=2))
+
+
+@st.cache_resource(show_spinner=False)
+def _job_store():
+    """Background generation jobs, process-wide. Module globals would be
+    re-created on every Streamlit rerun; a cached resource survives. Two
+    workers bound RAM and API concurrency; a third climber waits in line."""
+    return {"jobs": {}, "lock": threading.Lock(),
+            "executor": ThreadPoolExecutor(max_workers=2, thread_name_prefix="beta")}
+
 
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 ROUTES_ROOT      = os.path.join(_APP_DIR, "saved_routes")
 TEST_ROUTES_ROOT = os.path.join(_APP_DIR, "test_routes")
-SAVE_DIR         = os.path.join(ROUTES_ROOT, "last")
+
+
+def _visitor_id():
+    """A random id per browser, carried in the URL so a refresh or a dropped
+    connection finds the same working folder. Nothing is ever listed across
+    ids: one visitor cannot see another's photos."""
+    vid = st.session_state.get("visitor_id")
+    if not vid:
+        qp = st.query_params.get("v")
+        vid = qp if isinstance(qp, str) and re.fullmatch(r"[0-9a-f]{16}", qp) else uuid.uuid4().hex[:16]
+        st.session_state["visitor_id"] = vid
+    if st.query_params.get("v") != vid:
+        st.query_params["v"] = vid
+    return vid
+
+
+VISITOR_ID  = _visitor_id()
+VISITOR_DIR = os.path.join(ROUTES_ROOT, VISITOR_ID)
+SAVE_DIR    = os.path.join(VISITOR_DIR, "last")        # autosave for this visitor only
+UPLOAD_PATH = os.path.join(VISITOR_DIR, "upload.jpg")  # the normalised photo everything reads
 
 
 def _slugify(name):
     return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def _atomic_write(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _purge_old_visitor_dirs():
+    """Disk is ephemeral and shared by every visitor; keep it bounded."""
+    if not os.path.isdir(ROUTES_ROOT):
+        return
+    cutoff = time.time() - VISITOR_TTL_S
+    for name in os.listdir(ROUTES_ROOT):
+        path = os.path.join(ROUTES_ROOT, name)
+        try:
+            if name != VISITOR_ID and os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def save_route(target_dir=None):
@@ -50,30 +129,30 @@ def save_route(target_dir=None):
         "sequence":     ss.get("sequence"),
         "states":       ss.get("states"),
         "instructions": ss.get("instructions"),
+        "beta_status":  ss.get("beta_status"),
+        "beta_reason":  ss.get("beta_reason"),
     }
-    with open(os.path.join(target, "route.json"), "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    _atomic_write(os.path.join(target, "route.json"), json.dumps(data).encode("utf-8"))
     if ss.get("annotated_image") is not None:
-        ss["annotated_image"].save(os.path.join(target, "annotated.png"))
-    tmp = ss.get("tmp_path")
+        buf = io.BytesIO()
+        ss["annotated_image"].save(buf, format="PNG")
+        _atomic_write(os.path.join(target, "annotated.png"), buf.getvalue())
+    src = ss.get("tmp_path")
     original = os.path.join(target, "original.jpg")
-    if tmp and os.path.exists(tmp) and os.path.abspath(tmp) != os.path.abspath(original):
-        shutil.copyfile(tmp, original)
+    if src and os.path.exists(src) and os.path.abspath(src) != os.path.abspath(original):
+        shutil.copyfile(src, original + ".tmp")
+        os.replace(original + ".tmp", original)
     if ss.get("beta_gif"):
-        with open(os.path.join(target, "beta.gif"), "wb") as f:
-            f.write(ss["beta_gif"])
+        _atomic_write(os.path.join(target, "beta.gif"), ss["beta_gif"])
+    os.utime(VISITOR_DIR, None)
 
 
 def list_saved_routes():
-    """Names of all saved routes, 'last' (autosave) first."""
-    if not os.path.isdir(ROUTES_ROOT):
+    """Names of this visitor's saved routes (the autosave is not listed)."""
+    if not os.path.isdir(VISITOR_DIR):
         return []
-    names = [n for n in sorted(os.listdir(ROUTES_ROOT))
-             if os.path.exists(os.path.join(ROUTES_ROOT, n, "route.json"))]
-    if "last" in names:
-        names.remove("last")
-        names.insert(0, "last")
-    return names
+    return [n for n in sorted(os.listdir(VISITOR_DIR))
+            if n != "last" and os.path.exists(os.path.join(VISITOR_DIR, n, "route.json"))]
 
 
 def load_route(source_dir=None):
@@ -86,22 +165,22 @@ def load_route(source_dir=None):
     except Exception:
         return False
     ss = st.session_state
+    _clear_route_state()
     ss["holds"]           = data.get("holds") or []
     ss["start_holds"]     = data.get("start_holds") or []
     ss["annotated_image"] = annotated
     ss["base_image"]      = annotated
     ss["tmp_path"]        = os.path.join(source, "original.jpg")
     ss["current_step"]    = 0
-    ss.pop("sequence", None)
-    ss.pop("states", None)
-    ss.pop("instructions", None)
-    ss.pop("beta_gif", None)
     if data.get("sequence"):
         ss["sequence"] = data["sequence"]
     if data.get("states"):
         ss["states"] = data["states"]
     if data.get("instructions"):
         ss["instructions"] = data["instructions"]
+    if data.get("beta_status"):
+        ss["beta_status"] = data["beta_status"]
+        ss["beta_reason"] = data.get("beta_reason", "")
     gif_path = os.path.join(source, "beta.gif")
     if os.path.exists(gif_path):
         with open(gif_path, "rb") as f:
@@ -109,10 +188,21 @@ def load_route(source_dir=None):
     return True
 
 
+def _clear_route_state():
+    """Forget everything derived from the current photo (not the photo itself)."""
+    for key in ("holds", "annotated_image", "base_image", "start_holds", "sequence", "states",
+                "instructions", "beta_status", "beta_reason", "beta_gif", "beta_feedback",
+                "beta_error", "current_step", "last_click", "job_id"):
+        st.session_state.pop(key, None)
+    try:
+        del st.query_params["job"]
+    except KeyError:
+        pass
+
+
 def export_test_route(slug, colour, wall_angle, difficulty):
-    """Write the current route into test_routes/<slug>/ in the evaluation
-    format: wall photo, machine-readable data, and a route.md with the AI
-    beta prefilled and a section for the climber's verified beta."""
+    """Developer tool (CLIMBAI_DEV=1): write the current route into
+    test_routes/<slug>/ in the evaluation format."""
     target = os.path.join(TEST_ROUTES_ROOT, slug)
     os.makedirs(target, exist_ok=True)
     ss = st.session_state
@@ -172,6 +262,7 @@ START:
         }, f, indent=2)
     return os.path.relpath(target, _APP_DIR)
 
+
 def format_sequence_as_text(sequence, hold_descriptions):
     lines = []
     for move in sequence:
@@ -191,7 +282,7 @@ def format_sequence_as_text(sequence, hold_descriptions):
     return "\n\n".join(lines)
 
 
-def analyze_user_beta(annotated_image, holds, user_beta, height_cm, difficulty, wall_angle):
+def analyze_user_beta(client, annotated_image, holds, user_beta, height_cm, difficulty, wall_angle):
     """Rate My Beta: the climber describes their own sequence and gets coaching feedback."""
     buf = io.BytesIO()
     annotated_image.save(buf, format="JPEG")
@@ -199,9 +290,10 @@ def analyze_user_beta(annotated_image, holds, user_beta, height_cm, difficulty, 
 
     holds_description = build_holds_description(holds)
 
-    response = anthropic_client.messages.create(
+    response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1500,
+        timeout=60.0,
         system=f"""You are an experienced bouldering coach reviewing a climber's beta (their planned sequence). Be supportive but honest — like a good coach at the gym.
 
 Your feedback should cover:
@@ -283,6 +375,115 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
             draw.text((hx, hy), str(current_move["move_number"]), fill="black", font=mfont, anchor="mm")
 
     return image
+
+
+def click_image_for(annotated_image, start_holds):
+    """What the tap-to-select component shows: a phone-sized copy of the
+    annotated photo with the chosen start holds ringed. Shipping the
+    full-size image as PNG on every tap was tens of megabytes."""
+    w, h = annotated_image.size
+    cw = min(w, CLICK_IMAGE_MAX_W)
+    scale = cw / w
+    img = annotated_image if cw == w else annotated_image.resize((cw, round(h * scale)), Image.Resampling.LANCZOS)
+    if start_holds:
+        img = img.copy()
+        draw = ImageDraw.Draw(img)
+        mr, _ = _marker_metrics(w)
+        r = int(mr * scale * 1.6)
+        for hold in start_holds:
+            x, y = hold["x"] * scale, hold["y"] * scale
+            draw.ellipse([x - r, y - r, x + r, y + r], outline="#4ade80", width=max(3, int(4 * scale)))
+    return img
+
+
+# ---- Background beta generation ----
+# Generation is 10-60 sequential model calls (30-90 s). Running it inside the
+# Streamlit script meant any rerun, phone lock or dropped WebSocket killed it
+# and threw away every move already paid for. A worker thread owns the job;
+# the page polls it and can reattach to it by id after a reconnect.
+
+def _start_generation_job(client, holds, start_holds, finish_hold, height_cm, difficulty,
+                          wall_angle, finish_style, extra_notes, image_size, wall_height_cm):
+    store = _job_store()
+    now = time.time()
+    with store["lock"]:
+        for jid in [j for j, v in store["jobs"].items() if now - v["created"] > JOB_TTL_S]:
+            del store["jobs"][jid]
+        job_id = uuid.uuid4().hex[:12]
+        job = {"progress": 0, "total": MAX_MOVES, "result": None, "error": None,
+               "started": False, "done": False, "created": now, "visitor": VISITOR_ID}
+        store["jobs"][job_id] = job
+
+    holds = [dict(h) for h in holds]
+    start_holds = [dict(h) for h in start_holds]
+    image_width, image_height = image_size
+    graph = build_reachability_graph(holds, image_height, image_width, height_cm, wall_height_cm=wall_height_cm)
+    hold_descriptions = build_holds_description(holds)
+
+    def on_progress(n, total):
+        job["progress"], job["total"] = n, total
+
+    def work():
+        job["started"] = True
+        try:
+            job["result"] = generate_sequence_iteratively(
+                client, hold_descriptions, holds, graph, start_holds,
+                height_cm, difficulty, wall_angle, finish_style, extra_notes,
+                image_height=image_height, progress_callback=on_progress,
+                wall_height_cm=wall_height_cm, finish_hold=finish_hold,
+            )
+        except Exception:
+            log.exception("generation job %s crashed", job_id)
+            job["error"] = "Something went wrong while generating the beta — please try again."
+        finally:
+            job["done"] = True
+
+    store["executor"].submit(work)
+    return job_id
+
+
+def _consume_job(job):
+    ss = st.session_state
+    res = job["result"]
+    if job["error"] or res is None:
+        ss["beta_error"] = job["error"] or "Beta generation did not finish — please try again."
+        return
+    if res.status == "error" and len(res.sequence) <= 1:
+        ss["beta_error"] = res.reason
+        return
+    hold_descriptions = build_holds_description(ss["holds"])
+    ss["instructions"]  = format_sequence_as_text(res.sequence, hold_descriptions)
+    ss["sequence"]      = res.sequence
+    ss["states"]        = res.states
+    ss["beta_status"]   = res.status
+    ss["beta_reason"]   = res.reason
+    ss["current_step"]  = 0
+    ss["base_image"]    = ss["annotated_image"]
+    ss.pop("beta_gif", None)
+    save_route()
+
+
+@st.fragment(run_every=1.0)
+def _generation_progress():
+    store = _job_store()
+    job = store["jobs"].get(st.session_state.get("job_id"))
+    if job is None:
+        st.session_state.pop("job_id", None)
+        return
+    if job["done"]:
+        _consume_job(job)
+        st.session_state.pop("job_id", None)
+        try:
+            del st.query_params["job"]
+        except KeyError:
+            pass
+        st.rerun()
+    n, total = job["progress"], job["total"]
+    if not job["started"]:
+        st.progress(0.0, text="Waiting for a free slot — another climber's beta is generating right now.")
+    else:
+        st.progress(min(n / total, 1.0), text=f"Working out move {n} (up to {total}) — about 3–5 seconds per move")
+    st.caption("You can lock your phone or switch apps — this page keeps working and shows the beta when you come back.")
 
 
 # ---- UI ----
@@ -440,9 +641,58 @@ def section_header(num, title, caption=None):
     if caption:
         st.markdown(f"""<p class="section-caption">{caption}</p>""", unsafe_allow_html=True)
 
+
+if not get_api_key():
+    st.error("ClimbAI isn't configured yet — the owner needs to set ANTHROPIC_API_KEY.")
+    st.stop()
+
+
+def _unlocked():
+    """Optional access code for a private beta: one key serves everyone, so
+    the link is not public until the owner says so. Remembered per visitor
+    link, so a refresh does not ask again."""
+    if not ACCESS_CODE or st.session_state.get("unlocked"):
+        return True
+    if os.path.exists(os.path.join(VISITOR_DIR, ".unlocked")):
+        st.session_state["unlocked"] = True
+        return True
+    return False
+
+
+if not _unlocked():
+    st.markdown("""<p class="section-caption">ClimbAI is in a private beta. Enter the access code you were given.</p>""", unsafe_allow_html=True)
+    code = st.text_input("Access code", type="password", label_visibility="collapsed", placeholder="Access code")
+    if st.button("Enter", type="primary"):
+        if hmac.compare_digest(code.strip(), ACCESS_CODE):
+            os.makedirs(VISITOR_DIR, exist_ok=True)
+            with open(os.path.join(VISITOR_DIR, ".unlocked"), "w") as f:
+                f.write("1")
+            st.session_state["unlocked"] = True
+            st.rerun()
+        else:
+            st.error("That code didn't match.")
+    st.stop()
+
+anthropic_client = get_client()
+
+if os.getenv("CLIMBAI_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+    st.info("ClimbAI's AI features are switched off right now — routes you already generated still work.")
+
+# A generation started before a refresh or a dropped connection: pick it back up.
+_qp_job = st.query_params.get("job")
+if _qp_job and "job_id" not in st.session_state and _qp_job in _job_store()["jobs"]:
+    st.session_state["job_id"] = _qp_job
+
 section_header("01", "The route", "A clear, straight-on photo works best.")
 
 uploaded_file = st.file_uploader("Climbing wall photo", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+# Only mount the camera widget on request — mounted, it asks for camera
+# permission the moment the page loads, even inside a collapsed expander.
+if st.toggle("Take a photo with the camera instead"):
+    camera_shot = st.camera_input("Camera", label_visibility="collapsed")
+    if uploaded_file is None and camera_shot is not None:
+        uploaded_file = camera_shot
+st.markdown("""<p class="section-caption">Photos stay on the server only for your session and are deleted within a day. Try to keep other climbers out of the frame.</p>""", unsafe_allow_html=True)
 
 col1, col2 = st.columns(2)
 with col1:
@@ -454,11 +704,12 @@ with col2:
 
 col3, col4 = st.columns(2)
 with col3:
-    start_style = st.selectbox("Start marking",
-        ["START label", "Tape on hold", "Two hands on lowest holds", "Not marked"])
+    wall_height_m = st.number_input("Wall height (m)", min_value=2.5, max_value=6.0, value=4.0, step=0.5,
+        help="Roughly how much wall the photo shows, top to bottom. This sets the scale for what's in reach.")
 with col4:
     finish_style = st.selectbox("Finish marking",
         ["TOP label", "Tape on hold", "Top-out (both hands on top)", "Not marked"])
+wall_height_cm = int(wall_height_m * 100)
 
 section_header("02", "About you")
 
@@ -473,49 +724,97 @@ extra_notes = st.text_area("Notes (optional)",
     placeholder="e.g. 'There is a big move in the middle'",
     height=80)
 
+upload_ok = False
 if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        tmp.write(uploaded_file.read())
-        tmp_path = tmp.name
-
-    section_header("03", "Detect holds")
-
-    if st.button("Detect holds", use_container_width=True, type="primary"):
+    data = uploaded_file.getvalue()
+    digest = hashlib.sha1(data).hexdigest()
+    if st.session_state.get("upload_digest") != digest:
+        # A new photo: normalise it once (orientation, size) and forget the old route.
         try:
-            with st.spinner("Detecting holds and analysing types..."):
-                annotated_image, holds = detect_and_validate_holds(anthropic_client, tmp_path, colour)
-                st.session_state["annotated_image"] = annotated_image
-                st.session_state["holds"]           = holds
-                st.session_state["tmp_path"]        = tmp_path
-                st.session_state["start_holds"]     = []
-                st.session_state.pop("sequence",      None)
-                st.session_state.pop("instructions",  None)
-                st.session_state.pop("beta_feedback", None)
-                st.session_state.pop("states",        None)
-                st.session_state.pop("beta_gif",      None)
-                st.session_state["current_step"]    = 0
-                save_route()
-        except Exception:
-            st.error("Hold detection hit a snag — likely a network hiccup. Give it another go.")
+            os.makedirs(VISITOR_DIR, exist_ok=True)
+            prepare_upload(data, UPLOAD_PATH)
+        except ImageRejected as e:
+            st.error(str(e))
+        else:
+            _clear_route_state()
+            st.session_state.pop("detect_cache", None)
+            st.session_state["upload_digest"] = digest
+            st.session_state["tmp_path"] = UPLOAD_PATH
+    upload_ok = st.session_state.get("upload_digest") == digest
 
-elif "holds" not in st.session_state and list_saved_routes():
     section_header("03", "Detect holds")
-    st.markdown("""<p class="section-caption">No photo uploaded — load a route from your library instead. No re-detection or regeneration needed.</p>""", unsafe_allow_html=True)
-    col_pick, col_load = st.columns([2, 1])
-    with col_pick:
-        chosen_route = st.selectbox("Saved routes", list_saved_routes(), label_visibility="collapsed")
-    with col_load:
-        if st.button("Load route", use_container_width=True, type="primary"):
-            if load_route(os.path.join(ROUTES_ROOT, chosen_route)):
-                st.rerun()
+
+    if upload_ok and st.button("Detect holds", use_container_width=True, type="primary"):
+        try:
+            # Same photo + same colour again (a second tap, or toggling back
+            # after trying another colour) costs nothing.
+            cache = st.session_state.setdefault("detect_cache", {})
+            cached = cache.get((digest, colour))
+            if cached:
+                annotated_image, holds = cached[0], [dict(h) for h in cached[1]]
             else:
-                st.warning("Couldn't load that route — upload a photo instead.")
+                guardrails.LEDGER.check("detect", VISITOR_ID)
+                with st.spinner("Detecting holds and analysing types..."):
+                    guardrails.LEDGER.count("detect", VISITOR_ID)
+                    _purge_old_visitor_dirs()
+                    annotated_image, holds = detect_and_validate_holds(anthropic_client, UPLOAD_PATH, colour)
+                cache[(digest, colour)] = (annotated_image, [dict(h) for h in holds])
+            _clear_route_state()
+            st.session_state["annotated_image"] = annotated_image
+            st.session_state["holds"]           = holds
+            st.session_state["start_holds"]     = []
+            st.session_state["current_step"]    = 0
+            save_route()
+        except LimitExceeded as e:
+            st.warning(str(e))
+        except NoHoldsFound as e:
+            st.warning(str(e))
+        except DetectionError as e:
+            st.error(str(e))
+        except anthropic.APIError as e:
+            log.warning("detection API error: %s", e)
+            st.error(friendly_api_error(e))
+        except Exception:
+            log.exception("detection failed")
+            st.error("Hold detection failed unexpectedly — please try again.")
+
+elif "holds" not in st.session_state:
+    # No photo this session: bring back this visitor's last route (same link,
+    # e.g. after a refresh), or offer their saved library.
+    if not st.session_state.get("restored_once"):
+        st.session_state["restored_once"] = True
+        if load_route(SAVE_DIR):
+            st.rerun()
+    saved = list_saved_routes()
+    if saved:
+        section_header("03", "Detect holds")
+        st.markdown("""<p class="section-caption">No photo uploaded — load one of your saved routes instead. No re-detection or regeneration needed.</p>""", unsafe_allow_html=True)
+        col_pick, col_load = st.columns([2, 1])
+        with col_pick:
+            chosen_route = st.selectbox("Saved routes", saved, label_visibility="collapsed")
+        with col_load:
+            if st.button("Load route", use_container_width=True, type="primary"):
+                if load_route(os.path.join(VISITOR_DIR, _slugify(chosen_route))):
+                    st.rerun()
+                else:
+                    st.warning("Couldn't load that route — upload a photo instead.")
 
 if "annotated_image" in st.session_state and st.session_state.get("holds"):
     holds           = st.session_state["holds"]
     annotated_image = st.session_state["annotated_image"]
+    if uploaded_file is None:
+        section_header("03", "Detect holds")
+        col_msg, col_reset = st.columns([3, 1])
+        with col_msg:
+            st.markdown("""<p class="section-caption" style="margin-top:0.6rem;">Restored your last route. Upload a new photo above to start another.</p>""", unsafe_allow_html=True)
+        with col_reset:
+            if st.button("Start over", use_container_width=True):
+                _clear_route_state()
+                st.session_state.pop("upload_digest", None)
+                shutil.rmtree(SAVE_DIR, ignore_errors=True)
+                st.rerun()
 
-    st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect. Detection wrong somewhere? Switch the click mode to add or remove holds.</p>""", unsafe_allow_html=True)
+    st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Tap the start hold(s) below — one if both hands start together, two if they start apart. Tap again to deselect. Detection wrong somewhere? Switch the tap mode to add or remove holds.</p>""", unsafe_allow_html=True)
 
     click_mode = st.radio(
         "Click mode",
@@ -526,14 +825,31 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
     )
 
     from streamlit_image_coordinates import streamlit_image_coordinates
-    value = streamlit_image_coordinates(annotated_image, key="hold_click", use_column_width="always")
+    start_holds_now = st.session_state.get("start_holds", [])
+    click_img = click_image_for(annotated_image, start_holds_now)
+    # JPEG, not the component's default uncompressed PNG: ~0.4 MB instead of
+    # ~20 MB per render on a phone photo.
+    value = streamlit_image_coordinates(click_img, key="hold_click", use_column_width="always",
+                                        image_format="JPEG")
+
+    def _click_id(v):
+        # The component stamps each tap; falling back to (x, y) would ignore a
+        # second tap on the same spot (deselect then reselect the same hold).
+        return v.get("unix_time") or (v["x"], v["y"])
+
+    # The component replays its last click on every rerun. Switching the tap
+    # mode must not re-apply that old tap as an add/remove — swallow it.
+    if st.session_state.get("prev_click_mode") != click_mode:
+        st.session_state["prev_click_mode"] = click_mode
+        st.session_state["last_click"] = _click_id(value) if value else None
+        value = None
 
     if value is not None:
         # The component reports clicks in DISPLAYED pixels (plus the displayed
         # size) — rescale into original image space or taps on phones, where
         # the image is shrunk to fit, would land on the wrong holds.
-        disp_w = value.get("width") or annotated_image.width
-        disp_h = value.get("height") or annotated_image.height
+        disp_w = value.get("width") or click_img.width
+        disp_h = value.get("height") or click_img.height
         click_x = value["x"] * annotated_image.width / disp_w
         click_y = value["y"] * annotated_image.height / disp_h
 
@@ -549,15 +865,19 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                 closest_hold = h
 
         last_click = st.session_state.get("last_click", None)
-        new_click  = (value["x"], value["y"])
+        new_click  = _click_id(value)
         is_new_click = last_click != new_click
+
+        def _drop_beta():
+            """Anything downstream of the holds/start is stale now."""
+            for key in ("sequence", "states", "instructions", "beta_status", "beta_reason", "beta_gif", "beta_error"):
+                st.session_state.pop(key, None)
 
         def _holds_edited():
             """After add/remove: redraw annotation, drop stale downstream state."""
             st.session_state["annotated_image"] = redraw_annotation(
                 st.session_state["tmp_path"], st.session_state["holds"])
-            for key in ("sequence", "states", "instructions", "beta_gif"):
-                st.session_state.pop(key, None)
+            _drop_beta()
             save_route()
 
         if is_new_click and click_mode == "Add hold":
@@ -578,8 +898,8 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
             st.rerun()
 
         elif is_new_click and click_mode == "Remove hold":
+            st.session_state["last_click"] = new_click
             if closest_hold and closest_dist < threshold:
-                st.session_state["last_click"] = new_click
                 st.session_state["holds"] = [h for h in holds if h["number"] != closest_hold["number"]]
                 st.session_state["start_holds"] = [
                     h for h in st.session_state.get("start_holds", [])
@@ -588,86 +908,87 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                 _holds_edited()
                 st.toast(f"Removed Hold {closest_hold['number']}")
                 st.rerun()
+            else:
+                st.toast("No hold there — tap closer to a marker to remove it.")
 
-        elif is_new_click and click_mode == "Select start holds" and "sequence" not in st.session_state:
+        elif is_new_click and click_mode == "Select start holds":
+            st.session_state["last_click"] = new_click
             if closest_hold and closest_dist < threshold:
-                st.session_state["last_click"] = new_click
-                start_holds = st.session_state.get("start_holds", [])
+                start_holds = list(st.session_state.get("start_holds", []))
                 hold_nums   = [h["number"] for h in start_holds]
                 if closest_hold["number"] in hold_nums:
                     start_holds = [h for h in start_holds if h["number"] != closest_hold["number"]]
                     st.toast(f"Deselected Hold {closest_hold['number']}")
+                elif len(start_holds) >= 2:
+                    st.toast("Two start holds max — deselect one first.")
+                    start_holds = None
                 else:
                     start_holds.append(closest_hold)
-                    st.toast(f"Selected Hold {closest_hold['number']} as start hold!")
-                st.session_state["start_holds"] = start_holds
+                    st.toast(f"Selected Hold {closest_hold['number']} as a start hold")
+                if start_holds is not None:
+                    st.session_state["start_holds"] = start_holds
+                    if "sequence" in st.session_state:
+                        _drop_beta()
+                        st.toast("Start changed — generate the beta again.")
+                    save_route()
+                    st.rerun()
+            else:
+                st.toast("No hold there — tap closer to a marker.")
 
     current_start_holds = st.session_state.get("start_holds", [])
     if current_start_holds:
         hold_nums = [str(h["number"]) for h in current_start_holds]
         st.success(f"Start holds: Hold {', Hold '.join(hold_nums)}")
     else:
-        st.info("Click the start hold(s) on the image above.")
+        st.info("Tap the start hold(s) on the image above.")
 
     section_header("04", "Suggested beta")
 
-    if st.button("Generate suggested beta", use_container_width=True, type="primary"):
+    highest = min(holds, key=lambda h: h["y"])["number"]
+    finish_options = [f"Highest hold (Hold {highest})"] + [f"Hold {n}" for n in sorted(h["number"] for h in holds)]
+    finish_choice = st.selectbox("Finish hold", finish_options,
+        help="Which hold is the top of the route? Defaults to the highest detected hold.")
+    finish_hold = highest if finish_choice.startswith("Highest") else int(finish_choice.split()[1])
+
+    if st.session_state.get("beta_error"):
+        st.error(st.session_state.pop("beta_error"))
+
+    job_running = st.session_state.get("job_id") in _job_store()["jobs"]
+    if job_running:
+        _generation_progress()
+    elif st.button("Generate suggested beta", use_container_width=True, type="primary"):
         current_start_holds = st.session_state.get("start_holds", [])
         if not current_start_holds:
-            st.warning("Please click on the start holds in the image before generating instructions.")
+            st.warning("Tap the start holds on the image before generating a beta.")
         else:
-            image = Image.open(st.session_state["tmp_path"])
-            image_width, image_height = image.size
-
-            graph = build_reachability_graph(
-                st.session_state["holds"],
-                image_height, image_width, height_cm
-            )
-
-            hold_descriptions = build_holds_description(st.session_state["holds"])
-
-            progress_bar = st.progress(0)
-            status       = st.empty()
-
-            def on_progress(move_num, max_moves):
-                progress_bar.progress(move_num / max_moves)
-                status.caption(f"Generating move {move_num}...")
-
             try:
-                sequence, states = generate_sequence_iteratively(
-                    anthropic_client,
-                    hold_descriptions,
-                    st.session_state["holds"],
-                    graph,
-                    current_start_holds,
+                guardrails.LEDGER.check("generate", VISITOR_ID)
+                guardrails.LEDGER.count("generate", VISITOR_ID)
+                image_size = Image.open(st.session_state["tmp_path"]).size
+                job_id = _start_generation_job(
+                    anthropic_client, st.session_state["holds"], current_start_holds, finish_hold,
                     height_cm, difficulty, wall_angle, finish_style, extra_notes,
-                    image_height=image_height,
-                    progress_callback=on_progress
+                    image_size, wall_height_cm,
                 )
+                st.session_state["job_id"] = job_id
+                st.query_params["job"] = job_id
+                st.rerun()
+            except LimitExceeded as e:
+                st.warning(str(e))
             except Exception:
-                progress_bar.empty()
-                status.empty()
-                st.error("Beta generation was interrupted — likely a network hiccup. Your holds are still here; just hit generate again.")
-            else:
-                progress_bar.empty()
-                status.empty()
-
-                instructions = format_sequence_as_text(sequence, hold_descriptions)
-                st.session_state["instructions"] = instructions
-                st.session_state["sequence"]     = sequence
-                st.session_state["states"]       = states
-                st.session_state["current_step"] = 0
-                st.session_state["base_image"]   = st.session_state["annotated_image"]
-                st.session_state.pop("beta_gif", None)
-                save_route()
+                log.exception("could not start generation")
+                st.error("Couldn't start the beta generation — please try again.")
 
 if "instructions" in st.session_state:
+    if st.session_state.get("beta_status") and st.session_state["beta_status"] != "complete":
+        st.warning(f"This beta is incomplete — {st.session_state.get('beta_reason', '')} "
+                   "Showing the moves it did work out; generate again for another attempt.")
     st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
     st.markdown(st.session_state["instructions"])
 
 if "sequence" in st.session_state and st.session_state["sequence"]:
     sequence     = st.session_state["sequence"]
-    current_step = st.session_state.get("current_step", 0)
+    current_step = min(st.session_state.get("current_step", 0), len(sequence) - 1)
 
     section_header("05", "Walk it through", "Step through each move on the wall.")
 
@@ -687,8 +1008,8 @@ if "sequence" in st.session_state and st.session_state["sequence"]:
     st.markdown(f"""
     <div class="move-card">
         <div class="move-num">Move {current_step + 1} of {len(sequence)}</div>
-        <div class="move-text">{limb} &rarr; {hold_str}</div>
-        <div class="move-cue">{cue}</div>
+        <div class="move-text">{html.escape(limb)} &rarr; {html.escape(hold_str)}</div>
+        <div class="move-cue">{html.escape(cue)}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -718,6 +1039,7 @@ if "sequence" in st.session_state and st.session_state["sequence"]:
                     sequence,
                     st.session_state["states"],
                     height_cm=height_cm,
+                    wall_height_cm=wall_height_cm,
                 )
                 st.session_state["beta_gif"] = gif_buf.getvalue()
                 save_route()
@@ -760,23 +1082,33 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
             st.warning("Describe your sequence first — which hands and feet go where, in order.")
         else:
             try:
+                guardrails.LEDGER.check("coach", VISITOR_ID)
                 with st.spinner("Your coach is taking a look..."):
+                    guardrails.LEDGER.count("coach", VISITOR_ID)
                     feedback = analyze_user_beta(
+                        anthropic_client,
                         st.session_state["annotated_image"],
                         st.session_state["holds"],
                         user_beta,
                         height_cm, difficulty, wall_angle
                     )
                     st.session_state["beta_feedback"] = feedback
+            except LimitExceeded as e:
+                st.warning(str(e))
+            except anthropic.APIError as e:
+                log.warning("coaching API error: %s", e)
+                st.error(friendly_api_error(e))
             except Exception:
-                st.error("The coach lost connection — try again in a moment.")
+                log.exception("coaching failed")
+                st.error("The coach couldn't answer just now — try again in a moment.")
 
     if "beta_feedback" in st.session_state:
         st.markdown(st.session_state["beta_feedback"])
 
 # ---- Save & export ----
 if "sequence" in st.session_state and st.session_state.get("holds"):
-    section_header("07", "Save this route", "Keep it in your library, or export it as a test case for improving the AI.")
+    section_header("07", "Save this route",
+                   "Keep it in your library for this browser — come back to this same link to find it again.")
 
     route_name = st.text_input(
         "Route name",
@@ -785,22 +1117,27 @@ if "sequence" in st.session_state and st.session_state.get("holds"):
         label_visibility="collapsed"
     )
 
-    col_save, col_export = st.columns(2)
+    col_save, col_export = st.columns(2) if DEV_MODE else (st.container(), None)
     with col_save:
         if st.button("Save to library", use_container_width=True):
             slug = _slugify(route_name)
-            if not slug:
+            if not slug or slug == "last":
                 st.warning("Give the route a name first.")
             else:
-                save_route(os.path.join(ROUTES_ROOT, slug))
-                st.success(f"Saved to library as '{slug}' — load it any time from the start screen.")
-    with col_export:
-        if st.button("Export as test route", use_container_width=True):
-            slug = _slugify(route_name)
-            if not slug:
-                st.warning("Give the route a name first.")
-            else:
-                path = export_test_route(slug, colour, wall_angle, difficulty)
-                st.success(f"Exported to {path} — open route.md and fill in your verified beta after climbing it.")
+                save_route(os.path.join(VISITOR_DIR, slug))
+                st.success(f"Saved as '{slug}'. It stays available from this link until the server restarts.")
+    if DEV_MODE:
+        with col_export:
+            if st.button("Export as test route", use_container_width=True):
+                slug = _slugify(route_name)
+                if not slug:
+                    st.warning("Give the route a name first.")
+                else:
+                    path = export_test_route(slug, colour, wall_angle, difficulty)
+                    st.success(f"Exported to {path} — open route.md and fill in your verified beta after climbing it.")
+
+if DEV_MODE:
+    with st.expander("Developer: today's usage"):
+        st.json(guardrails.LEDGER.status())
 
 st.markdown("""<p class="climb-footer">climbai &mdash; get through the plateau</p>""", unsafe_allow_html=True)

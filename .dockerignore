@@ -1,0 +1,19 @@
+# Keep the deploy image small: only the app and its modules ship.
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.claude/
+.env
+.streamlit/secrets.toml
+saved_routes/
+test_routes/
+tests/
+docs/
+assets/
+scripts/
+*.jpg
+*.png
+*.gif
+*.pt
