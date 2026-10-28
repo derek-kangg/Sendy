@@ -1,6 +1,7 @@
 """Detection failure modes must surface as typed, user-facing errors instead
-of empty results or crashes. Uses synthetic images and a fake client — no
-API calls."""
+of empty results or crashes, and the OpenCV colour stage must find the holds
+real gym photos taught us it missed. Uses synthetic images and a fake client
+— no API calls."""
 
 import os
 import tempfile
@@ -15,13 +16,21 @@ from hold_detection import (DetectionError, NoHoldsFound, detect_and_validate_ho
                             find_hold_candidates)
 
 
+BLUE = (220, 90, 20)   # BGR
+
+
 def _wall(path, blobs=(), size=(800, 1000), bgr=(60, 60, 60)):
     """Grey wall with filled blue circles at the given (x, y, r) positions."""
     img = np.full((size[1], size[0], 3), bgr, dtype=np.uint8)
     for x, y, r in blobs:
-        cv2.circle(img, (x, y), r, (220, 90, 20), -1)     # BGR blue
+        cv2.circle(img, (x, y), r, BLUE, -1)
     cv2.imwrite(path, img)
     return path
+
+
+def _covers(cands, x, y):
+    """True if some candidate's box contains the point."""
+    return any(c["bx"] <= x <= c["bx"] + c["bw"] and c["by"] <= y <= c["by"] + c["bh"] for c in cands)
 
 
 class _FakeClient:
@@ -111,6 +120,85 @@ class DetectionTests(unittest.TestCase):
             detect_and_validate_holds(client, self.path, "Blue")
         text = client.calls[0]["messages"][0]["content"][-1]["text"]
         self.assertIn(f"{hold_detection.MAX_CANDIDATES} numbered candidate", text)
+
+
+class ColourStageTests(unittest.TestCase):
+    """The OpenCV candidate stage on synthetic walls: colour ranges,
+    wall-paint rejection and the tape trimmer. PNG keeps the colours exact."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "wall.png")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_red_hue_wrap(self):
+        # Crimson sits at the top of the hue circle (OpenCV hue ~174), where a
+        # single 0-10 range never looked; pure red (hue 0) must still count.
+        crimson, pure_red = (40, 0, 200), (0, 0, 220)
+        self.assertGreaterEqual(cv2.cvtColor(np.uint8([[crimson]]), cv2.COLOR_BGR2HSV)[0, 0, 0], 170)
+        img = np.full((1000, 800, 3), (60, 60, 60), dtype=np.uint8)
+        holds = [((200, 800), crimson), ((500, 500), crimson), ((650, 200), pure_red)]
+        for (x, y), bgr in holds:
+            cv2.circle(img, (x, y), 30, bgr, -1)
+        cv2.imwrite(self.path, img)
+        cands = find_hold_candidates(self.path, "Red")
+        self.assertEqual(len(cands), 3)
+        for (x, y), _ in holds:
+            self.assertTrue(_covers(cands, x, y), f"no red candidate at {(x, y)}")
+
+    def test_white_holds_on_a_light_wall(self):
+        # A white-painted wall must not come back as a giant candidate, while
+        # the cream and glossy-white holds sitting on it must — and a hold of
+        # another colour must not sprout white junk around it.
+        paint, cream, gloss = (192, 200, 215), (196, 214, 238), (250, 250, 250)
+        img = np.full((1000, 800, 3), paint, dtype=np.uint8)
+        holds = [((200, 300), cream), ((550, 450), cream), ((400, 750), gloss)]
+        for (x, y), bgr in holds:
+            cv2.circle(img, (x, y), 32, bgr, -1)
+        cv2.circle(img, (650, 150), 40, BLUE, -1)
+        cv2.imwrite(self.path, img)
+        cands = find_hold_candidates(self.path, "White")
+        for c in cands:
+            self.assertLess(c["bw"] * c["bh"], 0.05 * 800 * 1000, f"wall paint came back as a candidate: {c}")
+        for (x, y), _ in holds:
+            self.assertTrue(_covers(cands, x, y), f"white hold at {(x, y)} not found")
+        self.assertFalse(_covers(cands, 650, 150), "the blue hold is not a white candidate")
+        self.assertEqual(len(cands), 3)
+
+    def test_hold_with_tape_attached_is_kept(self):
+        # Phone-resolution frame, where tape may be up to 2.5% of the width
+        # (54px). A 44px chip with a 20px strip hanging off it used to be
+        # deleted as tape because the union is thin and elongated; now the
+        # strip is trimmed off and the chip kept with a tight box.
+        img = np.full((1600, 2160, 3), (60, 60, 60), dtype=np.uint8)
+        cv2.circle(img, (1000, 600), 22, BLUE, -1)
+        cv2.rectangle(img, (990, 620), (1010, 820), BLUE, -1)
+        cv2.imwrite(self.path, img)
+        cands = find_hold_candidates(self.path, "Blue")
+        self.assertEqual(len(cands), 1)
+        self.assertTrue(_covers(cands, 1000, 600))
+        self.assertLess(cands[0]["by"] + cands[0]["bh"], 700, "the tape strip should be trimmed off the box")
+
+    def test_lone_tape_strip_is_dropped(self):
+        img = np.full((1600, 2160, 3), (60, 60, 60), dtype=np.uint8)
+        cv2.rectangle(img, (990, 600), (1010, 820), BLUE, -1)       # a strip on its own
+        cv2.circle(img, (500, 400), 40, BLUE, -1)                    # a plain hold, as control
+        cv2.imwrite(self.path, img)
+        cands = find_hold_candidates(self.path, "Blue")
+        self.assertEqual(len(cands), 1)
+        self.assertTrue(_covers(cands, 500, 400))
+
+    def test_black_ceiling_follows_exposure(self):
+        # On a brightly lit wall black holds photograph at V~55-60, above the
+        # old fixed ceiling of 50.
+        img = np.full((1000, 800, 3), (210, 210, 210), dtype=np.uint8)
+        for x, y in ((200, 300), (500, 600)):
+            cv2.circle(img, (x, y), 30, (58, 58, 58), -1)
+        cv2.imwrite(self.path, img)
+        cands = find_hold_candidates(self.path, "Black")
+        self.assertEqual(len(cands), 2)
 
 
 if __name__ == "__main__":
